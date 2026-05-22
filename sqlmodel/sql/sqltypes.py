@@ -1,26 +1,18 @@
+from collections.abc import Mapping, Sequence
 from typing import (
     Any,
+    Generic,
     TypeVar,
-    Union,
     cast,
-    get_args,
-    get_origin,
 )
 
-from pydantic import BaseModel
-from pydantic_core import to_jsonable_python
-from sqlalchemy import JSON, types
-from sqlalchemy.dialects.postgresql import JSONB  # for Postgres JSONB
+from pydantic import BaseModel, TypeAdapter
+from sqlalchemy import JSON, TypeDecorator, types
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine.interfaces import Dialect
 
-BaseModelType = TypeVar("BaseModelType", bound=BaseModel)
 
-# Define a type alias for JSON-serializable values
-JSONValue = Union[dict[str, Any], list[Any], str, int, float, bool, None]
-JSON_VARIANT = JSON().with_variant(JSONB, "postgresql")
-
-
-class AutoString(types.TypeDecorator):
+class AutoString(TypeDecorator):
     impl = types.String
     cache_ok = True
     mysql_default_length = 255
@@ -32,70 +24,31 @@ class AutoString(types.TypeDecorator):
         return super().load_dialect_impl(dialect)
 
 
-class PydanticJSONB(types.TypeDecorator):  # type: ignore
+T = TypeVar("T", bound=BaseModel | Sequence[BaseModel] | Mapping[str, BaseModel])
+
+
+class PydanticJSONB(TypeDecorator, Generic[T]):
     """Custom type to automatically handle Pydantic model serialization."""
 
-    impl = JSON_VARIANT
+    impl = JSON().with_variant(JSONB, "postgresql")
     cache_ok = True  # allow SQLAlchemy to cache results
 
     def __init__(
         self,
-        model_class: type[BaseModelType]
-        | type[list[BaseModelType]]
-        | type[dict[str, BaseModelType]],
+        model_class: type[T],
         *args: Any,
         **kwargs: Any,
     ):
         super().__init__(*args, **kwargs)
-        self.model_class = model_class  # Pydantic model class to use
+        self.adapter = TypeAdapter(model_class)
+        self.coerce_compared_value = self.impl.coerce_compared_value
 
-    def process_bind_param(self, value: Any, dialect: Any) -> JSONValue:  # noqa: ANN401, ARG002, ANN001
+    def process_bind_param(self, value: Any, dialect: Dialect) -> Any:
         if value is None:
             return None
-        if isinstance(value, BaseModel):
-            return value.model_dump(mode="json")
-        if isinstance(value, list):
-            return [
-                m.model_dump(mode="json")
-                if isinstance(m, BaseModel)
-                else to_jsonable_python(m)
-                for m in value
-            ]
-        if isinstance(value, dict):
-            return {
-                k: v.model_dump(mode="json")
-                if isinstance(v, BaseModel)
-                else to_jsonable_python(v)
-                for k, v in value.items()
-            }
+        return self.adapter.dump_python(value, mode="json")
 
-        # We know to_jsonable_python returns a JSON-serializable value, but mypy sees it as an Any type
-        return to_jsonable_python(value)  # type: ignore[no-any-return]
-
-    def process_result_value(
-        self, value: Any, dialect: Any
-    ) -> BaseModelType | list[BaseModelType] | dict[str, BaseModelType] | None:  # noqa: ANN401, ARG002, ANN001
+    def process_result_value(self, value: Any, dialect: Dialect) -> T | None:
         if value is None:
             return None
-        if isinstance(value, dict):
-            # If model_class is a Dict type hint, handle key-value pairs
-            origin = get_origin(self.model_class)
-            if origin is dict:
-                model_class = get_args(self.model_class)[
-                    1
-                ]  # Get the value type (the model)
-                return {k: model_class.model_validate(v) for k, v in value.items()}
-            # Regular case: the whole dict represents a single model
-            return self.model_class.model_validate(value)  # type: ignore
-        if isinstance(value, list):
-            # If model_class is a List type hint
-            origin = get_origin(self.model_class)
-            if origin is list:
-                model_class = get_args(self.model_class)[0]
-                return [model_class.model_validate(v) for v in value]
-            # Fallback case (though this shouldn't happen given our __init__ types)
-            return [self.model_class.model_validate(v) for v in value]  # type: ignore
-
-        raise TypeError(
-            f"Unsupported type for PydanticJSONB from database: {type(value)}. Expected a dictionary or list."
-        )
+        return self.adapter.validate_python(value)
